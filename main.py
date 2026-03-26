@@ -4,50 +4,99 @@ import json
 import requests
 import pandas as pd
 import time
-from config import API_KEY, GROUP_ID, API_URL
+import cv2
+import numpy as np
+import re
 
-# --- 核心评分 Prompt (强化 JSON 要求) ---
-SYSTEM_PROMPT = """你是一位资深金相分析专家。请根据上传的金相照片评分（总分80分）。
-请严格按照以下 JSON 格式输出，不要包含任何开头、结尾或解释性文字：
+# 尝试导入配置
+try:
+    from config import API_KEY, GROUP_ID, API_URL
+except ImportError:
+    print("❌ 错误：未找到 config.py 文件或其中缺少 API_KEY, GROUP_ID, API_URL")
+    exit(1)
+
+# --- 核心评分 Prompt ---
+SYSTEM_PROMPT = """你是一位极其严格的金相评审专家。
+评分标准(总分80):
+1. 组织清晰度 (40分):仅在晶界锐利、无虚焦时给30+；模糊或过腐蚀直接降至20以下。
+2. 划痕 (20分):发现1条明显划痕扣5分；交叉划痕直接给0-5分。
+3. 假象 (20分)：有水迹、污点明显时，严厉扣分。
+
+请严格按 JSON 格式输出，不要包含任何 Markdown 标记（如 ```json），直接输出纯 JSON 对象：
 {
-  "total_score": 80.0,
   "details": {
-    "structure_clarity": {"score": 35, "reason": "晶界清晰"},
-    "scratches": {"score": 18, "reason": "无明显划痕"},
-    "artifacts": {"score": 15, "reason": "轻微污染"}
+    "structure_clarity": {"score": 0, "reason": ""},
+    "scratches": {"score": 0, "reason": ""},
+    "artifacts": {"score": 0, "reason": ""}
   },
   "overall_critique": "综合评价"
 }"""
 
+def preprocess_for_algorithm(image_path):
+    """专门为算法准备的增强：转灰度 + CLAHE 强化边缘"""
+    img = cv2.imread(image_path)
+    if img is None:
+        return None
+    # 转灰度
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # 自适应直方图均衡化 (限制对比度)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    # 双边滤波去噪并保留边缘
+    return cv2.bilateralFilter(enhanced, 5, 50, 50)
+
+def calculate_clarity(image_matrix):
+    """计算图像客观清晰度 (拉普拉斯方差法)"""
+    if image_matrix is None:
+        return 0.0
+    return round(cv2.Laplacian(image_matrix, cv2.CV_64F).var(), 2)
+
 def encode_image(image_path):
-    """图片转 Base64，并添加 Data URI 前缀"""
+    """图片转 Base64"""
     with open(image_path, "rb") as f:
         base64_data = base64.b64encode(f.read()).decode('utf-8')
         return f"data:image/jpeg;base64,{base64_data}"
 
-def analyze_image_minimax(image_path):
-    """调用 MiniMax 视觉模型 (兼容版)"""
-    print(f"🔍 正在分析: {os.path.basename(image_path)}...")
-    image_url = encode_image(image_path)
+def extract_json_robustly(text):
+    """强力 JSON 提取：处理截断、不可见字符及中文标点"""
+    if not text: return None
+    # 移除不可见字符
+    text = "".join(ch for ch in text if ch.isprintable() or ch in "\n\r\t")
+    try:
+        # 定位最外层的花括号
+        start = text.find('{')
+        end = text.rfind('}')
+        if start != -1 and end != -1:
+            json_str = text[start:end+1]
+            # 修正 AI 可能误用的中文标点
+            json_str = json_str.replace('，', ',').replace('：', ':')
+            return json.loads(json_str)
+    except Exception as e:
+        print(f"⚠️ JSON 解析修正失败: {e}")
+    return None
+
+def analyze_image_minimax(image_path, clarity_score):
+    """调用 MiniMax 视觉模型 (传入彩色原图)"""
+    try:
+        image_url = encode_image(image_path)
+    except Exception as e:
+        print(f"❌ 图片编码失败: {e}")
+        return None
     
     url = f"{API_URL}?GroupId={GROUP_ID}"
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
     
-    # 删除了引起 400 错误的 response_format 参数
+    # 结合算法数据
+    user_content = f"{SYSTEM_PROMPT}\n\n【算法参考数据】该图的拉普拉斯清晰度得分为: {clarity_score}。请以此为参考进行视觉评审。"
+    
     payload = {
-        "model": "abab6.5s-chat",
+        "model": "abab6.5s-chat", 
         "messages": [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": SYSTEM_PROMPT},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": image_url}
-                    }
+                    {"type": "text", "text": user_content},
+                    {"type": "image_url", "image_url": {"url": image_url}}
                 ]
             }
         ]
@@ -58,54 +107,74 @@ def analyze_image_minimax(image_path):
         response.raise_for_status()
         res_json = response.json()
         
-        # 提取回复内容
         reply_text = res_json['choices'][0]['message']['content']
-        
-        # 稳健性处理：去掉 Markdown 代码块标签
-        clean_json = reply_text.replace('```json', '').replace('```', '').strip()
-        
-        return json.loads(clean_json)
-        
+        return extract_json_robustly(reply_text)
     except Exception as e:
-        print(f"❌ 分析出错: {e}")
-        if 'response' in locals():
-            print(f"💡 服务器详细反馈: {response.text}")
+        print(f"❌ API 或网络错误: {e}")
         return None
 
 def main():
-    img_dir = "./images"
+    # 路径配置
+    input_dir = "./images"
     output_dir = "./output"
-    if not os.path.exists(output_dir): os.makedirs(output_dir)
+    temp_dir = os.path.join(output_dir, "algorithm_enhanced")
     
-    files = [f for f in os.listdir(img_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
+    files = [f for f in os.listdir(input_dir) if f.lower().endswith(valid_exts)] if os.path.exists(input_dir) else []
+    
     if not files:
-        print("💡 提示: images 文件夹里没有发现图片。")
+        print(f"⚠️ 未在 {input_dir} 找到图片。")
         return
 
     all_results = []
-    print(f"🚀 环境就绪，开始处理 {len(files)} 张图片...\n")
+    print(f"🚀 启动金相 AI 评审系统 (处理数: {len(files)})")
 
-    for filename in files:
-        data = analyze_image_minimax(os.path.join(img_dir, filename))
+    for i, filename in enumerate(files):
+        raw_path = os.path.join(input_dir, filename)
+        print(f"\n[{i+1}/{len(files)}] 正在分析: {filename}")
+        
+        # 1. 算法分支：获取增强灰度图并计算清晰度
+        algo_img = preprocess_for_algorithm(raw_path)
+        clarity_val = calculate_clarity(algo_img)
+        
+        # 保存增强后的图（供人工核对算法效果）
+        if algo_img is not None:
+            cv2.imwrite(os.path.join(temp_dir, f"enhanced_{filename}"), algo_img)
+        
+        # 2. AI 分支：发送彩色原图进行主观评价
+        data = analyze_image_minimax(raw_path, clarity_val)
+        
         if data:
+            details = data.get('details', {})
+            s_clarity = details.get('structure_clarity', {}).get('score', 0)
+            s_scratches = details.get('scratches', {}).get('score', 0)
+            s_artifacts = details.get('artifacts', {}).get('score', 0)
+            
             row = {
                 "文件名": filename,
-                "总分(80)": data.get('total_score'),
-                "清晰度得分": data.get('details', {}).get('structure_clarity', {}).get('score'),
-                "划痕得分": data.get('details', {}).get('scratches', {}).get('score'),
-                "综合评价": data.get('overall_critique'),
-                "处理时间": time.strftime("%H:%M:%S")
+                "总分(80)": s_clarity + s_scratches + s_artifacts,
+                "清晰度得分(40)": s_clarity,
+                "划痕得分(20)": s_scratches,
+                "假象得分(20)": s_artifacts,
+                "算法清晰度(Laplacian)": clarity_val,
+                "专家评语": data.get('overall_critique', "解析成功但无评语"),
+                "检测时间": time.strftime("%Y-%m-%d %H:%M:%S")
             }
             all_results.append(row)
-            time.sleep(1) # 免费版稍微留点空隙
+            print(f"✅ 完成评分: {row['总分(80)']}")
+        else:
+            print(f"⚠️ {filename} 处理失败，请检查网络或 AI 返回格式。")
 
     if all_results:
         df = pd.DataFrame(all_results)
-        df.to_excel(os.path.join(output_dir, "金相最终分析报告.xlsx"), index=False)
-        print("\n✨ 恭喜！分析任务全部完成！")
-        print(f"📊 报告位置: {os.path.abspath(output_dir)}")
+        report_name = f"金相分析报告_{time.strftime('%m%d_%H%M')}.xlsx"
+        df.to_excel(os.path.join(output_dir, report_name), index=False)
+        print(f"\n✨ 全部处理完成！报告位置: {output_dir}/{report_name}")
     else:
-        print("\n❌ 未能成功生成任何分析数据。")
+        print("\n💥 未生成任何结果。")
 
 if __name__ == "__main__":
     main()
