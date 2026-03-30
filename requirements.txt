@@ -1,0 +1,8 @@
+streamlit
+opencv-python-headless
+numpy
+pandas
+requests
+Pillow
+openpyxl
+#没有它，云端服务器不知道要安装 streamlit 和 opencv
